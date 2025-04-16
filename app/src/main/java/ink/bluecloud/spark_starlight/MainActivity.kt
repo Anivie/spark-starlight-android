@@ -279,42 +279,44 @@ fun GuideSystemScreen() {
             }
         )
         Spacer(modifier = Modifier.height(32.dp))
-        Button(onClick = {
-            Log.d("GuideSystemAudio", "Test Audio Button Clicked")
-            // Test button doesn't participate in the main loop signalling
-            val exampleData = runCatching {
-                val audioResId = R.raw.sample // Make sure this resource exists
-                context.resources.openRawResource(audioResId).use { input ->
-                    ByteArrayOutputStream().use { output ->
-                        input.copyTo(output)
-                        output.toByteArray()
+        if (!isSwitchedOn) Button(
+            onClick = {
+                Log.d("GuideSystemAudio", "Test Audio Button Clicked")
+                // Test button doesn't participate in the main loop signalling
+                val exampleData = runCatching {
+                    val audioResId = R.raw.sample // Make sure this resource exists
+                    context.resources.openRawResource(audioResId).use { input ->
+                        ByteArrayOutputStream().use { output ->
+                            input.copyTo(output)
+                            output.toByteArray()
+                        }
                     }
+                }.getOrElse {
+                    Log.e("GuideSystemAudio", "Error loading sample audio", it)
+                    null // Handle error case
                 }
-            }.getOrElse {
-                Log.e("GuideSystemAudio", "Error loading sample audio", it)
-                null // Handle error case
-            }
 
-            if (exampleData != null) {
-                // Create a dummy signal for the test button, it won't affect the main loop
-                val dummySignal = CompletableDeferred<Unit>()
-                // Add a completion handler just for logging/debugging the test
-                dummySignal.invokeOnCompletion { cause ->
-                    if (cause == null) {
-                        Log.d("GuideSystemAudio", "Test audio dummy signal completed.")
-                    } else {
-                        Log.e("GuideSystemAudio", "Test audio dummy signal completed with error", cause)
+                if (exampleData != null) {
+                    // Create a dummy signal for the test button, it won't affect the main loop
+                    val dummySignal = CompletableDeferred<Unit>()
+                    // Add a completion handler just for logging/debugging the test
+                    dummySignal.invokeOnCompletion { cause ->
+                        if (cause == null) {
+                            Log.d("GuideSystemAudio", "Test audio dummy signal completed.")
+                        } else {
+                            Log.e("GuideSystemAudio", "Test audio dummy signal completed with error", cause)
+                        }
                     }
+                    Log.d("GuideSystemAudio", "Playing test audio...")
+                    CoroutineScope(Dispatchers.Main).launch {
+                        audioPlayer.playAudio(exampleData, dummySignal)
+                    }
+                } else {
+                    Log.e("GuideSystemAudio", "Cannot play test audio, data is null.")
+                    // Optionally show a Toast message to the user
                 }
-                Log.d("GuideSystemAudio", "Playing test audio...")
-                CoroutineScope(Dispatchers.Main).launch {
-                    audioPlayer.playAudio(exampleData, dummySignal)
-                }
-            } else {
-                Log.e("GuideSystemAudio", "Cannot play test audio, data is null.")
-                // Optionally show a Toast message to the user
             }
-        }) {
+        ) {
             Text("Test Audio Playback")
         }
     }
@@ -364,14 +366,14 @@ fun CameraCaptureEffect(
                 Log.d("GuideSystemCamera", "Camera bound to lifecycle")
 
                 // --- THE CORE LOOP CHANGE ---
-                while (isActive && isSwitchedOn) {
+                while (isActive) {
                     // 1. Check if audio is currently playing. If so, wait.
                     while (AudioPlayer.AudioState.isPlaying() && isActive) {
                         Log.d("GuideSystemCamera", "Waiting for audio playback to finish...")
                         delay(500) // Check every 500ms
                     }
                     // Re-check isActive and isSwitchedOn after potential delay
-                    if (!isActive || !isSwitchedOn) break
+                    if (!isActive) break
 
                     // 2. Create the completion signal for this specific cycle
                     val cycleCompletionSignal = CompletableDeferred<Unit>()
