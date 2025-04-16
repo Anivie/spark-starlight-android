@@ -6,10 +6,10 @@ import android.graphics.Bitmap
 import android.media.MediaPlayer
 import android.os.Bundle
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.annotation.OptIn
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -43,30 +43,27 @@ import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import ink.bluecloud.spark_starlight.ui.theme.SparkstarlightTheme
+import io.zenoh.Config
+import io.zenoh.Session
+import io.zenoh.Zenoh
+import io.zenoh.bytes.ZBytes
+import io.zenoh.keyexpr.KeyExpr
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.Call
-import okhttp3.Callback
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.IOException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlin.uuid.ExperimentalUuidApi
+import kotlin.uuid.Uuid
 
 class MainActivity : ComponentActivity() {
     @ExperimentalPermissionsApi
@@ -92,88 +89,79 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-object ApiClient {
-    private val client = OkHttpClient()
-        .newBuilder()
-        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
 
-    interface UploadCallbacks {
-        fun onSuccess(responseBody: ByteArray)
-        fun onFailure(e: IOException)
-        fun onError(responseCode: Int, errorMessage: String?)
+@ExperimentalUuidApi
+object UUID {
+    val uuid by lazy {
+        Uuid.random()
     }
+}
 
-    fun uploadImage(
-        imageData: ByteArray,
-        imageMediaType: String,
-        callbacks: UploadCallbacks
-    ) {
-        // 1. Construct the URL
-        val url = "http://10.1.1.2:7447/uploadImage"
-        Log.d("ApiClient", "Request URL: $url")
-        Log.d("ApiClient", "Image data size: ${imageData.size} bytes")
-        Log.d("ApiClient", "Image media type: $imageMediaType")
-
-        // 2. Create the Request Body
-        val mediaType = imageMediaType.toMediaTypeOrNull()
-        if (mediaType == null) {
-            callbacks.onFailure(IOException("Invalid media type: $imageMediaType"))
+@ExperimentalUuidApi
+fun sendToServer(image: ByteArray, zenoh: Session) {
+    Log.d("GuideSystem", "Sending image to server, from: ${UUID.uuid}")
+    Log.d("GuideSystem", "Image size: ${image.size} bytes")
+    zenoh.put(
+        KeyExpr.tryFrom("spark/server").getOrNull()?: run {
+            Log.e("GuideSystem", "Failed to create KeyExpr")
             return
-        }
-        val requestBody: RequestBody = imageData.toRequestBody(mediaType)
-
-        // 3. Build the Request
-        val request = Request.Builder()
-            .url(url)
-            .post(requestBody)
-            .build()
-
-        // 4. Execute the Request Asynchronously
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                Log.e("ApiClient", "Upload failed", e)
-                callbacks.onFailure(e)
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                response.use {
-                    if (!response.isSuccessful) {
-                        val responseCode = response.code
-                        val errorBody = it.body?.string()
-                        Log.e("ApiClient", "Upload request failed with code: $responseCode, body: $errorBody")
-                        callbacks.onError(responseCode, errorBody)
-                    } else {
-                        val responseBody = it.body?.bytes()
-                        if (responseBody != null) {
-                            Log.d("ApiClient", "Upload successful: ${response.code}")
-                            callbacks.onSuccess(responseBody)
-                        } else {
-                            Log.e("ApiClient", "Upload successful but response body was null")
-                            callbacks.onFailure(IOException("Received null response body"))
-                        }
-                    }
-                }
-            }
-        })
+        },
+        ZBytes.from("uploadImage:${UUID.uuid}"),
+        attachment = ZBytes.from(image)
+    ).onFailure {
+        Log.e("GuideSystem", "Failed to send image to server: ${it.message}")
+    }.onSuccess {
+        Log.d("GuideSystem", "Image sent successfully")
     }
 }
 
 @Composable
+@ExperimentalUuidApi
 @ExperimentalPermissionsApi
-@OptIn(ExperimentalPermissionsApi::class, ExperimentalUuidApi::class)
 fun GuideSystemScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
+    val config = Config.fromJson(
+        """
+        {
+          mode: "client",
+          connect: {
+            endpoints: ["tcp/10.1.1.2:7447"],
+          },
+        }
+        """.trimIndent()
+    ).getOrThrow()
+    val zenoh = Zenoh.open(config)
+        .onFailure {
+            Toast.makeText(context, "Failed to open Zenoh session", Toast.LENGTH_SHORT).show()
+            Log.e("GuideSystem", "Failed to open Zenoh session: ${it.message}")
+        }
+        .getOrNull() ?: run {
+        return
+    }
+
     // Switch state
     var isSwitchedOn by remember { mutableStateOf(false) }
-
     // Camera Permission State
     val cameraPermissionState = rememberPermissionState(Manifest.permission.CAMERA)
-
     // Create AudioPlayer instance
     val audioPlayer = remember { AudioPlayer(context) }
+
+
+    zenoh.declareSubscriber(KeyExpr.tryFrom("spark/client/${UUID.uuid}").getOrNull() ?: return, { sample ->
+        Log.d("GuideSystem", "Received sample: ${sample.payload}")
+        Log.d("GuideSystem", "Got payload: ${sample.payload.toBytes().decodeToString()}")
+        if (sample.payload.toBytes().decodeToString() == "returnImageInfo") {
+            sample.attachment?.toBytes()?.let {
+                Log.d("GuideSystem", "Received image info: ${it.size} bytes")
+                CoroutineScope(Dispatchers.Main).launch {
+                    audioPlayer.playAudio(it)
+                }
+            }
+        }
+    })
+
 
     // Cleanup AudioPlayer on disposal
     DisposableEffect(Unit) {
@@ -191,26 +179,7 @@ fun GuideSystemScreen() {
         onImageCaptured = { pngBytes ->
             // Launch sending in a separate coroutine to avoid blocking capture
             CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    ApiClient.uploadImage(pngBytes, "image/png", object : ApiClient.UploadCallbacks {
-                        override fun onSuccess(responseBody: ByteArray) {
-                            Log.d("GuideSystem", "Image upload successful: ${responseBody.size}")
-                            CoroutineScope(Dispatchers.Main).launch {
-                                audioPlayer.playAudio(responseBody)
-                            }
-                        }
-
-                        override fun onFailure(e: IOException) {
-                            Log.e("GuideSystem", "Image upload failed: ${e.message}", e)
-                        }
-
-                        override fun onError(responseCode: Int, errorMessage: String?) {
-                            Log.e("GuideSystem", "Image upload error (code $responseCode): $errorMessage")
-                        }
-                    })
-                } catch (e: Exception) {
-                    Log.e("GuideSystem", "Error sending image to server: ${e.message}", e)
-                }
+                sendToServer(pngBytes, zenoh)
             }
         }
     )

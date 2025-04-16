@@ -70,5 +70,5 @@ dependencies {
 
     implementation(libs.accompanist.permissions)
 
-    implementation(libs.okhttp)
+    implementation(libs.zenoh.kotlin.android)
 }
