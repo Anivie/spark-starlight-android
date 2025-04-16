@@ -3,10 +3,9 @@ package ink.bluecloud.spark_starlight
 import android.Manifest
 import android.content.Context
 import android.graphics.Bitmap
-import android.net.Uri
+import android.media.MediaPlayer
 import android.os.Bundle
 import android.util.Log
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -40,36 +39,34 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.datasource.ByteArrayDataSource
-import androidx.media3.datasource.DataSource
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.isGranted
 import com.google.accompanist.permissions.rememberPermissionState
 import ink.bluecloud.spark_starlight.ui.theme.SparkstarlightTheme
-import io.zenoh.Config
-import io.zenoh.Session
-import io.zenoh.Zenoh
-import io.zenoh.bytes.ZBytes
-import io.zenoh.keyexpr.KeyExpr
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlin.uuid.ExperimentalUuidApi
-import kotlin.uuid.Uuid
 
 class MainActivity : ComponentActivity() {
     @ExperimentalPermissionsApi
@@ -95,109 +92,94 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@ExperimentalUuidApi
-object UUID {
-    val uuid by lazy {
-        Uuid.random()
-    }
-}
+object ApiClient {
+    private val client = OkHttpClient()
+        .newBuilder()
+        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
 
-@ExperimentalUuidApi
-fun sendToServer(image: ByteArray, zenoh: Session, context: Context) {
-    Log.d("GuideSystem", "Sending image to server, from: ${UUID.uuid}")
-    Log.d("GuideSystem", "Image size: ${image.size} bytes")
-    val image = run {
-        val audioResId = R.raw.sample_image
-        val inputStream = context.resources.openRawResource(audioResId)
-        val outputStream = ByteArrayOutputStream()
-        val buffer = ByteArray(4096)
-        var read: Int
-        while (inputStream.read(buffer).also { read = it } != -1) {
-            outputStream.write(buffer, 0, read)
-        }
-        outputStream.toByteArray()
+    interface UploadCallbacks {
+        fun onSuccess(responseBody: ByteArray)
+        fun onFailure(e: IOException)
+        fun onError(responseCode: Int, errorMessage: String?)
     }
-    zenoh.put(
-        KeyExpr.tryFrom("spark/server").getOrNull()?: run {
-            Log.e("GuideSystem", "Failed to create KeyExpr")
+
+    fun uploadImage(
+        imageData: ByteArray,
+        imageMediaType: String,
+        callbacks: UploadCallbacks
+    ) {
+        // 1. Construct the URL
+        val url = "http://10.1.1.2:7447/uploadImage"
+        Log.d("ApiClient", "Request URL: $url")
+        Log.d("ApiClient", "Image data size: ${imageData.size} bytes")
+        Log.d("ApiClient", "Image media type: $imageMediaType")
+
+        // 2. Create the Request Body
+        val mediaType = imageMediaType.toMediaTypeOrNull()
+        if (mediaType == null) {
+            callbacks.onFailure(IOException("Invalid media type: $imageMediaType"))
             return
-        },
-        ZBytes.from("uploadImage:${UUID.uuid}"),
-        attachment = ZBytes.from(image)
-    ).onFailure {
-        Log.e("GuideSystem", "Failed to send image to server: ${it.message}")
-    }.onSuccess {
-        Log.d("GuideSystem", "Image sent successfully")
+        }
+        val requestBody: RequestBody = imageData.toRequestBody(mediaType)
+
+        // 3. Build the Request
+        val request = Request.Builder()
+            .url(url)
+            .post(requestBody)
+            .build()
+
+        // 4. Execute the Request Asynchronously
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                Log.e("ApiClient", "Upload failed", e)
+                callbacks.onFailure(e)
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                response.use {
+                    if (!response.isSuccessful) {
+                        val responseCode = response.code
+                        val errorBody = it.body?.string()
+                        Log.e("ApiClient", "Upload request failed with code: $responseCode, body: $errorBody")
+                        callbacks.onError(responseCode, errorBody)
+                    } else {
+                        val responseBody = it.body?.bytes()
+                        if (responseBody != null) {
+                            Log.d("ApiClient", "Upload successful: ${response.code}")
+                            callbacks.onSuccess(responseBody)
+                        } else {
+                            Log.e("ApiClient", "Upload successful but response body was null")
+                            callbacks.onFailure(IOException("Received null response body"))
+                        }
+                    }
+                }
+            }
+        })
     }
 }
 
 @Composable
-@OptIn(UnstableApi::class)
 @ExperimentalPermissionsApi
-@ExperimentalUuidApi
+@OptIn(ExperimentalPermissionsApi::class, ExperimentalUuidApi::class)
 fun GuideSystemScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-
-    val config = Config.fromJson(
-    """
-    {
-      mode: "client",
-      connect: {
-        endpoints: ["tcp/10.1.1.2:7447"],
-      },
-    }
-    """.trimIndent()
-    ).getOrThrow()
-    val zenoh = Zenoh.open(config)
-        .onFailure {
-            Toast.makeText(context, "Failed to open Zenoh session", Toast.LENGTH_SHORT).show()
-            Log.e("GuideSystem", "Failed to open Zenoh session: ${it.message}")
-        }
-        .getOrNull() ?: run {
-            return
-        }
 
     // Switch state
     var isSwitchedOn by remember { mutableStateOf(false) }
 
     // Camera Permission State
     val cameraPermissionState = rememberPermissionState(Manifest.permission.CAMERA)
-    // ExoPlayer instance using remember for lifecycle management
-    val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            // Optional: Add listeners for playback state, errors etc.
-            addListener(object : Player.Listener {
-                override fun onPlaybackStateChanged(playbackState: Int) {
-                    if (playbackState == Player.STATE_ENDED) {
-                        Log.d("GuideSystemAudio", "Playback ended")
-                    }
-                }
-                override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                    Log.e("GuideSystemAudio", "Player Error: ${error.message}", error)
-                }
-            })
-        }
-    }
 
-    zenoh.declareSubscriber(KeyExpr.tryFrom("spark/client/*").getOrNull() ?: return, { sample ->
-        Log.d("GuideSystem", "Received sample: ${sample.payload}")
-        Log.d("GuideSystem", "Got payload: ${sample.payload.toBytes().decodeToString()}")
-        if (sample.payload.toBytes().decodeToString() == "returnImageInfo") {
-            sample.attachment?.toBytes()?.let {
-                Log.d("GuideSystem", "Received image info: ${it.size} bytes")
-                CoroutineScope(Dispatchers.Main).launch {
-                    exoPlayer.playAudio(it)
-                }
-            }
-        }
-    })
+    // Create AudioPlayer instance
+    val audioPlayer = remember { AudioPlayer(context) }
 
-    // Cleanup ExoPlayer on disposal
+    // Cleanup AudioPlayer on disposal
     DisposableEffect(Unit) {
         onDispose {
-            exoPlayer.release()
-            Log.d("GuideSystemAudio", "ExoPlayer released")
+            audioPlayer.releaseMediaPlayer()
+            Log.d("GuideSystemAudio", "AudioPlayer released")
         }
     }
 
@@ -210,7 +192,22 @@ fun GuideSystemScreen() {
             // Launch sending in a separate coroutine to avoid blocking capture
             CoroutineScope(Dispatchers.IO).launch {
                 try {
-                    sendToServer(pngBytes, zenoh, context)
+                    ApiClient.uploadImage(pngBytes, "image/png", object : ApiClient.UploadCallbacks {
+                        override fun onSuccess(responseBody: ByteArray) {
+                            Log.d("GuideSystem", "Image upload successful: ${responseBody.size}")
+                            CoroutineScope(Dispatchers.Main).launch {
+                                audioPlayer.playAudio(responseBody)
+                            }
+                        }
+
+                        override fun onFailure(e: IOException) {
+                            Log.e("GuideSystem", "Image upload failed: ${e.message}", e)
+                        }
+
+                        override fun onError(responseCode: Int, errorMessage: String?) {
+                            Log.e("GuideSystem", "Image upload error (code $responseCode): $errorMessage")
+                        }
+                    })
                 } catch (e: Exception) {
                     Log.e("GuideSystem", "Error sending image to server: ${e.message}", e)
                 }
@@ -270,7 +267,7 @@ fun GuideSystemScreen() {
                 }
                 outputStream.toByteArray()
             }
-            exoPlayer.playAudio(exampleData)
+            audioPlayer.playAudio(exampleData)
         }) {
             Text("Test Audio Playback")
         }
@@ -284,7 +281,7 @@ fun CameraCaptureEffect(
     isSwitchedOn: Boolean,
     context: Context,
     lifecycleOwner: LifecycleOwner,
-    onImageCaptured: (ByteArray) -> Unit // Callback with PNG bytes
+    onImageCaptured: (ByteArray) -> Unit
 ) {
     // Executor for CameraX callbacks
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
@@ -374,7 +371,6 @@ fun CameraCaptureEffect(
     }
 }
 
-// Suspended function to capture image and convert to PNG ByteArray
 suspend fun captureImageAsPng(
     imageCapture: ImageCapture,
     executor: Executor
@@ -383,24 +379,20 @@ suspend fun captureImageAsPng(
     val imageProxy = imageCapture.takePicture(executor)
     Log.d("GuideSystemCamera", "ImageProxy received (Format: ${imageProxy.format})")
 
-    // IMPORTANT: Ensure imageProxy is closed after use!
     try {
-        // Conversion logic depends heavily on imageProxy.format
-        // Common format is YUV_420_888, which needs conversion.
-        // If format is JPEG, conversion is simpler. Let's assume YUV for robustness.
-        val bitmap = imageProxy.toBitmap() // Requires a conversion function
+        val bitmap = imageProxy.toBitmap()
 
         // Compress the Bitmap to PNG format in memory
         val outputStream = ByteArrayOutputStream()
         // Use Dispatchers.IO for potentially blocking compression
         withContext(Dispatchers.IO) {
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream) // Quality 100 for PNG (lossless)
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 100, outputStream)
         }
         val pngBytes = outputStream.toByteArray()
         Log.d("GuideSystemCamera", "Image converted to PNG: ${pngBytes.size} bytes")
         return pngBytes
     } finally {
-        imageProxy.close() // Crucial step to allow next capture
+        imageProxy.close()
         Log.d("GuideSystemCamera", "ImageProxy closed")
     }
 }
@@ -433,28 +425,52 @@ suspend fun ImageCapture.takePicture(executor: Executor): ImageProxy = suspendCo
     })
 }
 
-// Function to play audio bytes
-@OptIn(UnstableApi::class)
-fun ExoPlayer.playAudio(audioBytes: ByteArray) {
-    try {
-        Log.d("GuideSystemAudio", "Attempting to play audio (${audioBytes.size} bytes)")
-        // 1. Create a DataSource.Factory that reads from the byte array
-        val dataSourceFactory = DataSource.Factory {
-            ByteArrayDataSource(audioBytes)
-        }
-        // 2. Create a MediaSource using this factory
-        // Assuming WAV format, ProgressiveMediaSource should work.
-        // You might need a more specific MediaSource if it's a different raw format.
-        val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)
-            .createMediaSource(MediaItem.fromUri(Uri.EMPTY)) // URI is dummy here
+class AudioPlayer(private val context: Context) {
+    private var mediaPlayer: MediaPlayer? = null
 
-        // 3. Set the media source and prepare the player
-        setMediaSource(mediaSource)
-        prepare()
-        // 4. Start playback
-        playWhenReady = true
-        Log.d("GuideSystemAudio", "Audio playback started")
-    } catch (e: Exception) {
-        Log.e("GuideSystemAudio", "Error playing audio: ${e.message}", e)
+    fun playAudio(audioBytes: ByteArray) {
+        try {
+            Log.d("AudioPlayer", "Playing audio (${audioBytes.size} bytes)")
+
+            // Release previous instance if exists
+            releaseMediaPlayer()
+
+            // Create a temporary file to store the audio data
+            val tempFile = File.createTempFile("audio", ".wav", context.cacheDir)
+            FileOutputStream(tempFile).use { it.write(audioBytes) }
+
+            // Create and configure the MediaPlayer
+            mediaPlayer = MediaPlayer().apply {
+                setDataSource(tempFile.path)
+                setOnCompletionListener {
+                    Log.d("AudioPlayer", "Playback completed")
+                    releaseMediaPlayer()
+                    tempFile.delete()
+                }
+                setOnErrorListener { _, what, extra ->
+                    Log.e("AudioPlayer", "MediaPlayer error: what=$what, extra=$extra")
+                    releaseMediaPlayer()
+                    tempFile.delete()
+                    true
+                }
+                prepare()
+                start()
+            }
+
+            Log.d("AudioPlayer", "Audio playback started")
+        } catch (e: Exception) {
+            Log.e("AudioPlayer", "Error playing audio: ${e.message}", e)
+        }
+    }
+
+    fun releaseMediaPlayer() {
+        mediaPlayer?.let {
+            if (it.isPlaying) {
+                it.stop()
+            }
+            it.release()
+            mediaPlayer = null
+            Log.d("AudioPlayer", "MediaPlayer released")
+        }
     }
 }

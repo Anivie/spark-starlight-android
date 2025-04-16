@@ -56,6 +56,7 @@ dependencies {
     androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
+    runtimeOnly(libs.kotlinx.coroutines.guava)
 
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.core)
@@ -69,5 +70,5 @@ dependencies {
 
     implementation(libs.accompanist.permissions)
 
-    implementation(libs.zenoh.kotlin.android)
+    implementation(libs.okhttp)
 }
